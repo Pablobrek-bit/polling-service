@@ -1,6 +1,7 @@
-import z from "zod";
+import z, { optional } from "zod";
 import { prisma } from "../../lib/prisma-client";
 import { FastifyInstance } from "fastify";
+import { redis } from "../../lib/redis";
 
 export async function getPoll(app: FastifyInstance) {
   app.get("/polls/:pollID", async (request, reply) => {
@@ -26,6 +27,34 @@ export async function getPoll(app: FastifyInstance) {
       },
     });
 
-    return reply.status(201).send(poll);
+    if (!poll) {
+      return reply.status(404).send({ message: "Poll not found" });
+    }
+
+    const result = await redis.zrange(pollID, 0, -1, "WITHSCORES");
+
+    const votes = result.reduce((obj, line, index) => {
+      if (index % 2 === 0) {
+        const score = result[index + 1];
+
+        Object.assign(obj, { [line]: Number(score) });
+      }
+
+      return obj;
+    }, {} as Record<string, number>);
+
+    return reply.status(201).send({
+      poll: {
+        id: poll.id,
+        title: poll.title,
+        options: poll.options.map((option) => {
+          return {
+            id: option.id,
+            title: option.title,
+            score: option.id in votes ? votes[option.id] : 0,
+          };
+        }),
+      },
+    });
   });
 }

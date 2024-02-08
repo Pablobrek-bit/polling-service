@@ -2,9 +2,11 @@ import z from "zod";
 import { prisma } from "../../lib/prisma-client";
 import { randomUUID } from "crypto";
 import { FastifyInstance } from "fastify";
+import { redis } from "../../lib/redis";
+import { voting } from "../../utils/voting-pub-sub";
 
 export async function voteOnPoll(app: FastifyInstance) {
-  app.post("/polls", async (request, reply) => {
+  app.post("/polls/:pollId/votes", async (request, reply) => {
     const voteOnPollBody = z.object({
       pollOptionId: z.string().uuid(),
     });
@@ -18,6 +20,44 @@ export async function voteOnPoll(app: FastifyInstance) {
 
     let sessionId = request.cookies.sessionId;
 
+    if (sessionId) {
+      const userPreviousVoteOnPoll = await prisma.vote.findUnique({
+        where: {
+          sessionId_pollId: {
+            sessionId,
+            pollId,
+          },
+        },
+      });
+
+      if (
+        userPreviousVoteOnPoll &&
+        userPreviousVoteOnPoll.pollOptionId !== pollOptionId
+      ) {
+        await prisma.vote.delete({
+          where: {
+            id: userPreviousVoteOnPoll.id,
+          },
+        });
+
+        // Esse comando está fazendo com que decremente em 1 o valor do pollOptionId no pollId
+        const votes = await redis.zincrby(
+          pollId,
+          -1,
+          userPreviousVoteOnPoll.pollOptionId
+        );
+
+        voting.publish(pollId, {
+          pollOptionId: userPreviousVoteOnPoll.pollOptionId,
+          votes: Number(votes),
+        });
+      } else if (userPreviousVoteOnPoll) {
+        return reply.status(400).send({
+          error: "You have already voted on this poll",
+        });
+      }
+    }
+
     if (!sessionId) {
       sessionId = randomUUID();
 
@@ -28,6 +68,22 @@ export async function voteOnPoll(app: FastifyInstance) {
         httpOnly: true,
       });
     }
+
+    await prisma.vote.create({
+      data: {
+        sessionId,
+        pollId,
+        pollOptionId,
+      },
+    });
+
+    // Esse comando está fazendo com que incremente em 1 o valor do pollOptionId no pollId
+    const votes = await redis.zincrby(pollId, 1, pollOptionId);
+
+    voting.publish(pollId, {
+      pollOptionId,
+      votes: Number(votes),
+    });
 
     return reply.status(201).send();
   });
